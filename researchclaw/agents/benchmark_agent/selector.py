@@ -133,13 +133,13 @@ class SelectorAgent(BaseAgent):
     ) -> dict[str, Any]:
         """Ask LLM to make final selection from filtered candidates."""
         bench_summary = "\n".join(
-            f"- {b['name']} (tier {b.get('tier', '?')}, "
+            f"- {b.get('name', 'Unknown')} (tier {b.get('tier', '?')}, "
             f"origin: {b.get('origin', '?')}, "
             f"metrics: {b.get('metrics', [])})"
             for b in benchmarks[:15]
         )
         base_summary = "\n".join(
-            f"- {bl['name']}: {bl.get('paper', 'N/A')}"
+            f"- {bl.get('name', 'Unknown')}: {bl.get('paper', 'N/A')}"
             for bl in baselines[:10]
         )
 
@@ -160,7 +160,13 @@ class SelectorAgent(BaseAgent):
             "- Select 2-4 baselines (must include at least 1 classic + 1 recent)\n"
             "- Primary benchmark MUST be the domain standard\n"
             "- Prefer benchmarks that top-venue papers commonly use\n"
-            "- Consider dataset size vs time budget"
+            "- Consider dataset size vs time budget\n"
+            "- CRITICAL: Only select benchmarks that are RELEVANT to the research "
+            "topic's domain. Do NOT select image classification datasets (CIFAR, "
+            "MNIST) for non-image tasks like PDE solvers, RL, or optimization.\n"
+            "- CRITICAL: Baselines must be COMPETING METHODS, not optimizers. "
+            "SGD/Adam/AdamW/Cosine LR are NOT baselines — they are training "
+            "tools. Baselines must be alternative approaches to the same problem."
         )
         user = (
             f"Research Topic: {topic}\n\n"
@@ -181,20 +187,18 @@ class SelectorAgent(BaseAgent):
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Resolve LLM-selected names back to full benchmark/baseline dicts."""
         # Build name lookup
-        bench_map = {b["name"]: b for b in benchmarks}
-        base_map = {bl["name"]: bl for bl in baselines}
+        bench_map = {b.get("name", f"bench_{i}"): b for i, b in enumerate(benchmarks)}
+        base_map = {bl.get("name", f"base_{i}"): bl for i, bl in enumerate(baselines)}
 
         selected_bench: list[dict[str, Any]] = []
         primary = selection.get("primary_benchmark", "")
         if primary and primary in bench_map:
-            entry = bench_map[primary]
-            entry["role"] = "primary"
+            entry = {**bench_map[primary], "role": "primary"}
             selected_bench.append(entry)
 
         for name in selection.get("secondary_benchmarks", []):
             if name in bench_map and name != primary:
-                entry = bench_map[name]
-                entry["role"] = "secondary"
+                entry = {**bench_map[name], "role": "secondary"}
                 selected_bench.append(entry)
 
         selected_base: list[dict[str, Any]] = []
@@ -244,11 +248,9 @@ class SelectorAgent(BaseAgent):
             )
         else:
             # Not enough to warrant LLM call — use top ranked
-            selected_bench = ranked_bench[:3]
-            if selected_bench:
-                selected_bench[0]["role"] = "primary"
-                for b in selected_bench[1:]:
-                    b["role"] = "secondary"
+            # BUG-DA6-06: Create copies to avoid mutating input dicts
+            selected_bench = [{**b, "role": "primary"} if i == 0 else {**b, "role": "secondary"}
+                              for i, b in enumerate(ranked_bench[:3])]
             selected_base = ranked_base[:self._min_base]
             selection = {}
 
@@ -256,8 +258,7 @@ class SelectorAgent(BaseAgent):
         if len(selected_bench) < self._min_bench and ranked_bench:
             for b in ranked_bench:
                 if b not in selected_bench:
-                    b["role"] = "secondary"
-                    selected_bench.append(b)
+                    selected_bench.append({**b, "role": "secondary"})
                 if len(selected_bench) >= self._min_bench:
                     break
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from researchclaw.templates.conference import (
@@ -29,6 +31,9 @@ from researchclaw.templates.converter import (
     _parse_alignments,
     _render_itemize,
     _render_enumerate,
+    _reset_render_counters,
+    _next_table_num,
+    _next_figure_num,
     check_paper_completeness,  # noqa: F401
 )
 
@@ -315,17 +320,27 @@ class TestBuildBody:
         assert r"\section{Title}" not in body
         assert r"\section{Abstract}" not in body
 
-    def test_subsection(self) -> None:
+    def test_subsection_promoted_when_all_h2(self) -> None:
+        """T1.3: When all body sections are H2, they should be promoted to \\section."""
         md = "## Method\ntext"
         sections = _parse_sections(md)
         body = _build_body(sections)
-        assert r"\subsection{Method}" in body
+        # All-H2 document → auto-promoted to \section
+        assert r"\section{Method}" in body
+
+    def test_h2_promoted_under_h1_title(self) -> None:
+        """When title occupies H1, H2 body sections promote to \\section."""
+        md = "# My Paper\ntitle body\n## Method\ntext"
+        sections = _parse_sections(md)
+        body = _build_body(sections, title="My Paper")
+        assert r"\section{Method}" in body
 
     def test_subsubsection(self) -> None:
-        md = "### Details\ntext"
+        md = "## Intro\nintro\n### Details\ntext"
         sections = _parse_sections(md)
         body = _build_body(sections)
-        assert r"\subsubsection{Details}" in body
+        # H2 promoted to \section, H3 promoted to \subsection
+        assert r"\subsection{Details}" in body
 
 
 class TestListRendering:
@@ -372,6 +387,24 @@ class TestTableRendering:
         assert r"\bottomrule" in result
         assert r"\end{tabular}" in result
         assert r"\end{table}" in result
+
+    def test_render_counters_are_thread_local(self) -> None:
+        results: list[tuple[int, int, int]] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            _reset_render_counters()
+            value = (_next_table_num(), _next_table_num(), _next_figure_num())
+            with lock:
+                results.append(value)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert results == [(1, 2, 1)] * 4
 
 
 # =====================================================================

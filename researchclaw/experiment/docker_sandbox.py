@@ -18,21 +18,29 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from researchclaw.config import DockerSandboxConfig
-from researchclaw.experiment.sandbox import SandboxResult, parse_metrics
+from researchclaw.experiment.sandbox import (
+    SandboxResult,
+    parse_metrics,
+    validate_entry_point,
+    validate_entry_point_resolved,
+)
 
 logger = logging.getLogger(__name__)
 
 _CONTAINER_COUNTER = 0
+_counter_lock = threading.Lock()
 
 
 def _next_container_name() -> str:
     global _CONTAINER_COUNTER  # noqa: PLW0603
-    _CONTAINER_COUNTER += 1
-    return f"rc-exp-{_CONTAINER_COUNTER}-{os.getpid()}"
+    with _counter_lock:
+        _CONTAINER_COUNTER += 1
+        return f"rc-exp-{_CONTAINER_COUNTER}-{os.getpid()}"
 
 
 # Packages already in the Docker image — skip during auto-detect.
@@ -137,19 +145,38 @@ class DockerSandbox:
             shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
 
+        # Pre-copy syntax validation — fail fast before any I/O
+        err = validate_entry_point(entry_point)
+        if err:
+            return SandboxResult(
+                returncode=-1, stdout="", stderr=err,
+                elapsed_sec=0.0, metrics={},
+            )
+
         # Inject harness first (immutable)
         self._inject_harness(staging)
 
-        # Copy project files (skip harness overwrite)
-        for src_file in project_dir.iterdir():
-            if src_file.is_file():
-                dest = staging / src_file.name
-                if dest.name == "experiment_harness.py":
-                    logger.warning(
-                        "Project contains experiment_harness.py — skipping (immutable)"
-                    )
-                    continue
-                dest.write_bytes(src_file.read_bytes())
+        # Copy project files and subdirectories (skip harness overwrite)
+        import shutil as _shutil
+        for src_item in project_dir.iterdir():
+            dest = staging / src_item.name
+            if src_item.name == "experiment_harness.py":
+                logger.warning(
+                    "Project contains experiment_harness.py — skipping (immutable)"
+                )
+                continue
+            if src_item.is_file():
+                dest.write_bytes(src_item.read_bytes())
+            elif src_item.is_dir() and not src_item.name.startswith((".", "__")):
+                _shutil.copytree(src_item, dest, dirs_exist_ok=True)
+
+        # Post-copy resolve check — catches symlink-based escapes
+        err = validate_entry_point_resolved(staging, entry_point)
+        if err:
+            return SandboxResult(
+                returncode=-1, stdout="", stderr=err,
+                elapsed_sec=0.0, metrics={},
+            )
 
         entry = staging / entry_point
         if not entry.exists():
@@ -371,20 +398,29 @@ class DockerSandbox:
             user_datasets.mkdir(parents=True, exist_ok=True)
             cmd.extend(["-v", f"{user_datasets}:/workspace/data:rw"])
 
-        # Mount HuggingFace model cache (read-write for downloading)
+        # Mount HuggingFace model cache (read-only for model weights).
+        # BUG-103 fix: Don't set HF_HOME to the read-only mount — the
+        # transformers library writes token/telemetry files under HF_HOME.
+        # Instead, use HF_HUB_CACHE for read-only model access and let
+        # HF_HOME default to a writable location inside the container.
         hf_mounted = False
+        _hf_hub_cache = "/home/researcher/.cache/huggingface/hub"
         hf_home_env = os.environ.get("HF_HOME", "").strip()
         if hf_home_env:
             xdg_hf = Path(hf_home_env).resolve()
             if xdg_hf.is_dir():
-                cmd.extend(["-v", f"{xdg_hf}:/home/researcher/.cache/huggingface"])
-                cmd.extend(["-e", "HF_HOME=/home/researcher/.cache/huggingface"])
+                cmd.extend(["-v", f"{xdg_hf}:{_hf_hub_cache}:ro"])
+                cmd.extend(["-e", f"HF_HUB_CACHE={_hf_hub_cache}"])
                 hf_mounted = True
         if not hf_mounted:
             hf_cache_host = Path.home() / ".cache" / "huggingface"
             if hf_cache_host.is_dir():
-                cmd.extend(["-v", f"{hf_cache_host}:/home/researcher/.cache/huggingface"])
-                cmd.extend(["-e", "HF_HOME=/home/researcher/.cache/huggingface"])
+                cmd.extend(["-v", f"{hf_cache_host}:{_hf_hub_cache}:ro"])
+                cmd.extend(["-e", f"HF_HUB_CACHE={_hf_hub_cache}"])
+
+        # BUG-107 fix: Set TORCH_HOME to writable location so torchvision
+        # can download pretrained model weights (e.g., Inception-v3 for FID).
+        cmd.extend(["-e", "TORCH_HOME=/workspace/.cache/torch"])
 
         # Pass HF token if available (for gated model downloads)
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -395,7 +431,7 @@ class DockerSandbox:
         if cfg.gpu_enabled:
             if cfg.gpu_device_ids:
                 device_spec = ",".join(str(d) for d in cfg.gpu_device_ids)
-                cmd.extend(["--gpus", f'"device={device_spec}"'])
+                cmd.extend(["--gpus", f"device={device_spec}"])
             else:
                 cmd.extend(["--gpus", "all"])
 

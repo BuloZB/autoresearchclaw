@@ -705,6 +705,113 @@ def test_package_deliverables_includes_style_files(
     assert "neurips_2025.sty" in manifest["files"]
 
 
+# ── Atomic checkpoint write tests ──
+
+
+def test_write_checkpoint_uses_atomic_rename(run_dir: Path) -> None:
+    """Checkpoint must be written via temp file + rename, not direct write"""
+    rc_runner._write_checkpoint(run_dir, Stage.TOPIC_INIT, "run-atomic")
+    cp = run_dir / "checkpoint.json"
+    assert cp.exists()
+    data = json.loads(cp.read_text(encoding="utf-8"))
+    assert data["last_completed_stage"] == int(Stage.TOPIC_INIT)
+    assert data["run_id"] == "run-atomic"
+
+
+def test_write_checkpoint_leaves_no_temp_files(run_dir: Path) -> None:
+    """Atomic write must clean up temp files on success"""
+    rc_runner._write_checkpoint(run_dir, Stage.TOPIC_INIT, "run-clean")
+    temps = list(run_dir.glob("*.tmp"))
+    assert temps == [], f"Leftover temp files: {temps}"
+
+
+def test_write_checkpoint_preserves_old_on_write_failure(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the temp-file write fails, the existing checkpoint must survive"""
+    import builtins
+
+    rc_runner._write_checkpoint(run_dir, Stage.TOPIC_INIT, "run-ok")
+
+    original_open = builtins.open
+
+    def _exploding_open(path, *args, **kwargs):
+        # After os.close(fd), _write_checkpoint opens via path string —
+        # intercept temp-file opens (checkpoint_*.tmp)
+        if isinstance(path, (str, Path)) and "checkpoint_" in str(path):
+            raise OSError("disk full")
+        if isinstance(path, int):
+            raise OSError("disk full")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _exploding_open)
+    with pytest.raises(OSError):
+        rc_runner._write_checkpoint(run_dir, Stage.PROBLEM_DECOMPOSE, "run-ok")
+
+    # Original checkpoint must be intact
+    data = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    assert data["last_completed_stage"] == int(Stage.TOPIC_INIT)
+    # Temp file must be cleaned up
+    assert list(run_dir.glob("checkpoint_*.tmp")) == []
+
+
+def test_write_checkpoint_overwrites_previous(run_dir: Path) -> None:
+    """A second checkpoint call must fully replace the first"""
+    rc_runner._write_checkpoint(run_dir, Stage.TOPIC_INIT, "run-1")
+    rc_runner._write_checkpoint(run_dir, Stage.PROBLEM_DECOMPOSE, "run-1")
+    data = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    assert data["last_completed_stage"] == int(Stage.PROBLEM_DECOMPOSE)
+    assert data["last_completed_name"] == Stage.PROBLEM_DECOMPOSE.name
+
+
+def _degraded(stage: Stage) -> StageResult:
+    return StageResult(
+        stage=stage,
+        status=StageStatus.DONE,
+        artifacts=("quality_report.json",),
+        decision="degraded",
+    )
+
+
+def test_degraded_quality_gate_continues_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When quality gate returns decision='degraded', pipeline continues to completion."""
+    seen: list[Stage] = []
+
+    def mock_execute_stage(stage: Stage, **kwargs) -> StageResult:
+        _ = kwargs
+        seen.append(stage)
+        if stage == Stage.QUALITY_GATE:
+            return _degraded(stage)
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="run-degraded",
+        config=rc_config,
+        adapters=adapters,
+    )
+    # All 23 stages should execute (not stopped at quality gate)
+    assert len(results) == 23
+    assert seen == list(STAGE_SEQUENCE)
+    # Quality gate result should have decision="degraded"
+    qg_result = [r for r in results if r.stage == Stage.QUALITY_GATE][0]
+    assert qg_result.decision == "degraded"
+    assert qg_result.status == StageStatus.DONE
+    # Pipeline summary should have degraded=True
+    summary = json.loads((run_dir / "pipeline_summary.json").read_text())
+    assert summary["degraded"] is True
+    # Output should show DEGRADED message
+    captured = capsys.readouterr()
+    assert "DEGRADED" in captured.out
+
+
 def test_package_deliverables_called_after_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     run_dir: Path,

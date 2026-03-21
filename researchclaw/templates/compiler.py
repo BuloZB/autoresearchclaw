@@ -146,6 +146,35 @@ def fix_common_latex_errors(
     fixes: list[str] = []
     fixed = tex_text
 
+    # --- Pre-error-loop fixes: structural repairs that prevent compilation ---
+
+    # Fix escaped braces in tabular column specs: \{lcccc\} → {lcccc}
+    if re.search(r"\\begin\{tabular\}\\\{", fixed):
+        fixed = re.sub(
+            r"\\begin\{tabular\}\\\{([^}]*?)\\\}",
+            r"\\begin{tabular}{\1}",
+            fixed,
+        )
+        fixes.append("Fixed escaped braces in tabular column specs")
+
+    # Collapse multiple consecutive \clearpage into one
+    if re.search(r"(\\clearpage\s*){2,}", fixed):
+        fixed = re.sub(r"(\\clearpage\s*){2,}", "\\clearpage\n", fixed)
+        fixes.append("Collapsed multiple \\clearpage commands")
+
+    # Remove \textbf{Figure N.} paragraphs that follow \end{figure}
+    dup_cap = re.search(
+        r"(\\end\{figure\})\s*\n\s*\\textbf\{Figure\s+\d+",
+        fixed,
+    )
+    if dup_cap:
+        fixed = re.sub(
+            r"(\\end\{figure\})\s*\n\s*\\textbf\{Figure\s+\d+[.:].*?\}\s*\n",
+            r"\1\n",
+            fixed,
+        )
+        fixes.append("Removed duplicate bold Figure captions after \\end{figure}")
+
     for err in errors:
         err_lower = err.lower()
 
@@ -188,9 +217,30 @@ def fix_common_latex_errors(
                     )
                     fixes.append(f"Removed missing package {pkg}")
 
-        # Too many unprocessed floats
-        if "too many unprocessed floats" in err_lower:
-            # Add \clearpage before problematic float
+        # Too many unprocessed floats / Float(s) lost
+        if "too many unprocessed floats" in err_lower or "float(s) lost" in err_lower:
+            # BUG-109 fix: Add \extrafloats and \clearpage for float overflow
+            if "\\extrafloats" not in fixed:
+                fixed = fixed.replace(
+                    "\\begin{document}",
+                    "\\begin{document}\n\\extrafloats{200}",
+                )
+                fixes.append("Added \\extrafloats{200} for float overflow")
+            # BUG-109b: \textwidth in 2-column causes oversized floats to be lost
+            if "\\resizebox{\\textwidth}" in fixed:
+                fixed = fixed.replace(
+                    "\\resizebox{\\textwidth}",
+                    "\\resizebox{\\columnwidth}",
+                )
+                fixes.append("Replaced \\textwidth with \\columnwidth in resizebox")
+            # Relax float placement from [ht] or [t] to [htbp!]
+            fixed = re.sub(
+                r"\\begin\{(table|figure)\}\[h?t\]",
+                r"\\begin{\1}[htbp!]",
+                fixed,
+            )
+            fixes.append("Relaxed float placement to [htbp!]")
+            # Add \clearpage before first table as last resort
             fixed = fixed.replace(
                 "\\begin{table}",
                 "\\clearpage\n\\begin{table}",
@@ -213,15 +263,23 @@ def _parse_log(log_text: str) -> tuple[list[str], list[str]]:
 
     for line in log_text.split("\n"):
         line_stripped = line.strip()
+        line_lower = line_stripped.lower()
         if line_stripped.startswith("!"):
             errors.append(line_stripped)
         elif "LaTeX Warning:" in line_stripped:
             warnings.append(line_stripped)
+        # BUG-R6-26: Use elif to avoid duplicating "!" lines
         elif "Undefined control sequence" in line_stripped:
             errors.append(line_stripped)
         elif "Missing" in line_stripped and "inserted" in line_stripped:
             errors.append(line_stripped)
         elif "File" in line_stripped and "not found" in line_stripped:
+            errors.append(line_stripped)
+        # BUG-R6-21: Detect "Float(s) lost" and "Too many unprocessed floats"
+        # even when they don't start with "!"
+        elif "float(s) lost" in line_lower:
+            errors.append(line_stripped)
+        elif "too many unprocessed floats" in line_lower:
             errors.append(line_stripped)
 
     return errors, warnings
@@ -340,6 +398,37 @@ def check_compiled_quality(
         )
 
     return result
+
+
+def remove_missing_figures(tex_text: str, stage_dir: Path) -> tuple[str, list[str]]:
+    """Remove \\begin{figure}...\\end{figure} blocks that reference missing images.
+
+    Returns ``(fixed_text, list_of_removed_paths)``.
+    """
+    removed: list[str] = []
+
+    def _check_fig(m: re.Match) -> str:
+        block = m.group(0)
+        img_match = re.search(r"\\includegraphics.*?\{([^}]+)\}", block)
+        if img_match:
+            img_rel = img_match.group(1)
+            img_path = stage_dir / img_rel
+            if not img_path.exists():
+                logger.warning(
+                    "Removing figure block with missing image: %s",
+                    img_rel,
+                )
+                removed.append(img_rel)
+                return ""  # Remove the entire figure block
+        return block
+
+    fixed = re.sub(
+        r"\\begin\{figure\}.*?\\end\{figure\}",
+        _check_fig,
+        tex_text,
+        flags=re.DOTALL,
+    )
+    return fixed, removed
 
 
 def _run_bibtex(work_dir: Path, stem: str, timeout: int = 60) -> bool:

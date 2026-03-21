@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,8 +13,137 @@ from collections.abc import Mapping
 from typing import cast
 
 from researchclaw.adapters import AdapterBundle
-from researchclaw.config import RCConfig
+from researchclaw.config import (
+    CONFIG_SEARCH_ORDER,
+    EXAMPLE_CONFIG,
+    RCConfig,
+    resolve_config_path,
+)
 from researchclaw.health import print_doctor_report, run_doctor, write_doctor_report
+
+
+# ---------------------------------------------------------------------------
+# OpenCode installation helpers
+# ---------------------------------------------------------------------------
+
+def _is_opencode_installed() -> bool:
+    """Check if the ``opencode`` CLI is available on PATH."""
+    opencode_cmd = shutil.which("opencode")
+    if opencode_cmd is None:
+        return False
+    try:
+        r = subprocess.run(
+            [opencode_cmd, "--version"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_npm_installed() -> bool:
+    """Check if ``npm`` is available on PATH."""
+    return shutil.which("npm") is not None
+
+
+def _install_opencode() -> bool:
+    """Install OpenCode globally via npm.  Returns True on success."""
+    print("  Installing opencode-ai (this may take a minute)...")
+    npm_cmd = shutil.which("npm")
+    if not npm_cmd:
+        print("  npm is not installed. Cannot install OpenCode.")
+        return False
+    try:
+        r = subprocess.run(
+            [npm_cmd, "i", "-g", "opencode-ai@latest"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            print("  OpenCode installed successfully!")
+            return True
+        else:
+            print(f"  Installation failed (exit {r.returncode}):")
+            if r.stderr:
+                for line in r.stderr.strip().splitlines()[:5]:
+                    print(f"    {line}")
+            return False
+    except subprocess.TimeoutExpired:
+        print("  Installation timed out.")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Installation failed: {exc}")
+        return False
+
+
+def _prompt_opencode_install() -> bool:
+    """Interactively prompt the user to install OpenCode.
+
+    Returns True if OpenCode is now available (already installed or
+    just installed successfully).  Returns False otherwise.
+    """
+    if _is_opencode_installed():
+        return True
+
+    if not sys.stdin.isatty():
+        return False
+
+    print()
+    print("=" * 60)
+    print("  OpenCode Beast Mode  (Recommended)")
+    print("=" * 60)
+    print()
+    print("  OpenCode is an AI coding agent that dramatically improves")
+    print("  experiment code generation for complex research tasks.")
+    print()
+    print("  With OpenCode enabled, ResearchClaw can generate multi-file")
+    print("  experiment projects with custom architectures, training")
+    print("  loops, and ablation studies — far beyond single-file limits.")
+    print()
+
+    if not _is_npm_installed():
+        print("  Node.js/npm is required but not installed.")
+        print("  To install OpenCode later:")
+        print("    1. Install Node.js: https://nodejs.org/")
+        print("    2. Run: npm i -g opencode-ai@latest")
+        print("    — or: researchclaw setup")
+        print()
+        return False
+
+    try:
+        answer = input("  Install OpenCode now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+    if answer in ("", "y", "yes"):
+        success = _install_opencode()
+        if not success:
+            print("  You can retry later with: researchclaw setup")
+        return success
+    else:
+        print("  Skipped. You can install later with: researchclaw setup")
+        return False
+
+
+def _resolve_config_or_exit(args: argparse.Namespace) -> Path | None:
+    """Resolve config path from args, printing helpful errors on failure.
+
+    Returns the resolved Path on success, or None if the config cannot be found
+    (after printing an error message to stderr).
+    """
+    path = resolve_config_path(getattr(args, "config", None))
+    if path is not None and not path.exists():
+        print(f"Error: config file not found: {path}", file=sys.stderr)
+        return None
+    if path is None:
+        search_list = ", ".join(CONFIG_SEARCH_ORDER)
+        print(
+            f"Error: no config file found (searched: {search_list}).\n"
+            f"Run 'researchclaw init' to create one from the example template.",
+            file=sys.stderr,
+        )
+        return None
+    return path
 
 
 def _generate_run_id(topic: str) -> str:
@@ -22,7 +153,10 @@ def _generate_run_id(topic: str) -> str:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    config_path = Path(cast(str, args.config))
+    resolved = _resolve_config_or_exit(args)
+    if resolved is None:
+        return 1
+    config_path = resolved
     topic = cast(str | None, args.topic)
     output = cast(str | None, args.output)
     from_stage_name = cast(str | None, args.from_stage)
@@ -30,13 +164,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     skip_preflight = cast(bool, args.skip_preflight)
     resume = cast(bool, args.resume)
     skip_noncritical = cast(bool, args.skip_noncritical_stage)
-
-    if not config_path.exists():
-        print(f"Error: config file not found: {config_path}", file=sys.stderr)
-        return 1
+    no_graceful_degradation = cast(bool, args.no_graceful_degradation)
 
     kb_root_path = None
     config = RCConfig.load(config_path, check_paths=False)
+
+    # Override graceful_degradation if CLI flag is set
+    if no_graceful_degradation:
+        import dataclasses as _dc_gd
+
+        new_research = _dc_gd.replace(config.research, graceful_degradation=False)
+        config = _dc_gd.replace(config, research=new_research)
+
+    # Derive gate behavior from project.mode (CLI --auto-approve overrides)
+    mode = config.project.mode.lower()
+    if auto_approve:
+        # Explicit CLI flag takes precedence over config mode
+        stop_on_gate = False
+    elif mode == "full-auto":
+        auto_approve = True
+        stop_on_gate = False
+    else:
+        # "semi-auto" and "docs-first" should block on gates
+        stop_on_gate = True
 
     if topic:
         import dataclasses
@@ -59,6 +209,35 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     run_id = _generate_run_id(config.research.topic)
     run_dir = Path(output or f"artifacts/{run_id}")
+
+    # BUG-119: When --resume without --output, search for the most recent
+    # existing run directory that matches the topic and has a checkpoint.
+    if resume and not output:
+        topic_hash = hashlib.sha256(config.research.topic.encode()).hexdigest()[:6]
+        artifacts_root = Path("artifacts")
+        if artifacts_root.is_dir():
+            candidates = sorted(
+                (
+                    d for d in artifacts_root.iterdir()
+                    if d.is_dir()
+                    and d.name.startswith("rc-")
+                    and d.name.endswith(f"-{topic_hash}")
+                    and (d / "checkpoint.json").exists()
+                ),
+                key=lambda d: d.name,
+                reverse=True,  # newest first (timestamp in name)
+            )
+            if candidates:
+                run_dir = candidates[0]
+                run_id = run_dir.name
+                print(f"Found existing run to resume: {run_dir}")
+            else:
+                print(
+                    "Warning: --resume specified but no checkpoint found "
+                    f"for topic hash '{topic_hash}'. Starting new run.",
+                    file=sys.stderr,
+                )
+
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if config.knowledge_base.root:
@@ -73,19 +252,38 @@ def cmd_run(args: argparse.Namespace) -> int:
     # --- Determine start stage ---
     from_stage = Stage.TOPIC_INIT
     if from_stage_name:
-        from_stage = Stage[from_stage_name.upper()]
+        try:
+            from_stage = Stage[from_stage_name.upper()]
+        except KeyError:
+            valid = ", ".join(s.name for s in Stage)
+            print(
+                f"Error: unknown stage '{from_stage_name}'. "
+                f"Valid stages: {valid}",
+                file=sys.stderr,
+            )
+            return 1
     elif resume:
         resumed = read_checkpoint(run_dir)
         if resumed is not None:
             from_stage = resumed
             print(f"Resuming from checkpoint: Stage {int(from_stage)}: {from_stage.name}")
 
-    print(f"ResearchClaw v0.1.0 — Starting pipeline")
+    from researchclaw import __version__
+    print(f"ResearchClaw v{__version__} — Starting pipeline")
     print(f"  Run ID:  {run_id}")
     print(f"  Topic:   {config.research.topic}")
     print(f"  Output:  {run_dir}")
-    print(f"  Mode:    {config.experiment.mode}")
+    print(f"  Mode:    {config.project.mode}")
     print(f"  From:    Stage {int(from_stage)}: {from_stage.name}")
+
+    # Hint: OpenCode beast mode
+    exp_cfg = getattr(config, "experiment", None)
+    oc_cfg = getattr(exp_cfg, "opencode", None)
+    if oc_cfg and getattr(oc_cfg, "enabled", False) and not _is_opencode_installed():
+        print()
+        print("  Hint: OpenCode beast mode is enabled but not installed.")
+        print("        Run 'researchclaw setup' to install for better code generation.")
+
     print()
 
     results = execute_pipeline(
@@ -95,6 +293,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         adapters=adapters,
         from_stage=from_stage,
         auto_approve_gates=auto_approve,
+        stop_on_gate=stop_on_gate,
         skip_noncritical=skip_noncritical,
         kb_root=kb_root_path,
     )
@@ -109,11 +308,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
     from researchclaw.config import validate_config
     import yaml
 
-    config_path = Path(cast(str, args.config))
-    no_check_paths = cast(bool, args.no_check_paths)
-    if not config_path.exists():
-        print(f"Error: config file not found: {config_path}", file=sys.stderr)
+    resolved = _resolve_config_or_exit(args)
+    if resolved is None:
         return 1
+    config_path = resolved
+    no_check_paths = cast(bool, args.no_check_paths)
 
     with config_path.open(encoding="utf-8") as f:
         loaded = cast(object, yaml.safe_load(f))
@@ -142,7 +341,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    config_path = Path(cast(str, args.config))
+    resolved = _resolve_config_or_exit(args)
+    if resolved is None:
+        return 1
+    config_path = resolved
     output = cast(str | None, args.output)
 
     report = run_doctor(config_path)
@@ -150,6 +352,171 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if output:
         write_doctor_report(report, Path(output))
     return 0 if report.overall == "pass" else 1
+
+_PROVIDER_CHOICES = {
+    "1": ("openai", "OPENAI_API_KEY"),
+    "2": ("openrouter", "OPENROUTER_API_KEY"),
+    "3": ("deepseek", "DEEPSEEK_API_KEY"),
+    "4": ("minimax", "MINIMAX_API_KEY"),
+    "5": ("acp", ""),
+}
+
+_PROVIDER_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "minimax": "https://api.minimax.io/v1",
+}
+
+_PROVIDER_MODELS = {
+    "openai": ("gpt-4o", ["gpt-4.1", "gpt-4o-mini"]),
+    "openrouter": (
+        "anthropic/claude-3.5-sonnet",
+        ["google/gemini-pro-1.5", "meta-llama/llama-3.1-70b-instruct"],
+    ),
+    "deepseek": ("deepseek-chat", ["deepseek-reasoner"]),
+    "minimax": ("MiniMax-M2.5", ["MiniMax-M2.5-highspeed"]),
+}
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    force = cast(bool, args.force)
+    dest = Path("config.arc.yaml")
+
+    if dest.exists() and not force:
+        print(f"{dest} already exists. Use --force to overwrite.", file=sys.stderr)
+        return 1
+
+    # Look for the example config: first in repo root (relative to package),
+    # then in CWD (for development), then bundled in the package data dir.
+    _candidates = [
+        Path(__file__).resolve().parent.parent / EXAMPLE_CONFIG,  # repo root
+        Path.cwd() / EXAMPLE_CONFIG,                              # cwd fallback
+        Path(__file__).resolve().parent / "data" / EXAMPLE_CONFIG, # packaged
+    ]
+    example = next((p for p in _candidates if p.exists()), None)
+    if example is None:
+        print(
+            f"Error: example config not found.\n"
+            f"Searched: {', '.join(str(c) for c in _candidates)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Interactive provider prompt (TTY only, else default to openai)
+    choice = "1"
+    if sys.stdin.isatty():
+        print("Select LLM provider:")
+        print("  1) openai       (requires OPENAI_API_KEY)")
+        print("  2) openrouter   (requires OPENROUTER_API_KEY)")
+        print("  3) deepseek     (requires DEEPSEEK_API_KEY)")
+        print("  4) minimax      (requires MINIMAX_API_KEY)")
+        print("  5) acp          (local AI agent — no API key needed)")
+        try:
+            raw = input("Choice [1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raw = ""
+        if raw in _PROVIDER_CHOICES:
+            choice = raw
+
+    provider, api_key_env = _PROVIDER_CHOICES[choice]
+
+    content = example.read_text(encoding="utf-8")
+
+    # String-based replacement to preserve YAML comments
+    content = content.replace(
+        'provider: "openai-compatible"', f'provider: "{provider}"'
+    )
+
+    if provider == "acp":
+        # ACP doesn't need base_url or api_key_env
+        content = content.replace(
+            'base_url: "https://api.openai.com/v1"', 'base_url: ""'
+        )
+        content = content.replace('api_key_env: "OPENAI_API_KEY"', 'api_key_env: ""')
+    else:
+        base_url = _PROVIDER_URLS.get(provider, "https://api.openai.com/v1")
+        content = content.replace(
+            'base_url: "https://api.openai.com/v1"', f'base_url: "{base_url}"'
+        )
+        if api_key_env:
+            content = content.replace(
+                'api_key_env: "OPENAI_API_KEY"', f'api_key_env: "{api_key_env}"'
+            )
+
+    if provider in _PROVIDER_MODELS:
+        primary, fallbacks = _PROVIDER_MODELS[provider]
+        content = content.replace('primary_model: "gpt-4o"', f'primary_model: "{primary}"')
+        # Replace fallback models block
+        old_fallbacks = '  fallback_models:\n    - "gpt-4.1"\n    - "gpt-4o-mini"'
+        new_fallbacks = "  fallback_models:\n" + "".join(
+            f'    - "{m}"\n' for m in fallbacks
+        )
+        content = content.replace(old_fallbacks, new_fallbacks.rstrip("\n"))
+
+    dest.write_text(content, encoding="utf-8")
+    print(f"Created {dest} (provider: {provider})")
+
+    if provider == "acp":
+        print("\nNext steps:")
+        print("  1. Ensure your ACP agent is installed and on PATH")
+        print("  2. Edit config.arc.yaml to set llm.acp.agent if needed")
+        print("  3. Run: researchclaw doctor")
+    else:
+        env_var = api_key_env or "OPENAI_API_KEY"
+        print(f"\nNext steps:")
+        print(f"  1. Export your API key: export {env_var}=sk-...")
+        print("  2. Edit config.arc.yaml to customize your settings")
+        print("  3. Run: researchclaw doctor")
+
+    # Offer OpenCode installation
+    _prompt_opencode_install()
+
+    return 0
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Post-install setup — check and install optional tools."""
+    print("ResearchClaw — Environment Setup\n")
+
+    # 1. OpenCode
+    if _is_opencode_installed():
+        try:
+            opencode_cmd = shutil.which("opencode") or "opencode"
+            r = subprocess.run(
+                [opencode_cmd, "--version"],
+                capture_output=True, text=True, timeout=15,
+            )
+            ver = r.stdout.strip() or "unknown"
+        except Exception:  # noqa: BLE001
+            ver = "unknown"
+        print(f"  [OK] OpenCode is installed (version: {ver})")
+    else:
+        installed = _prompt_opencode_install()
+        if installed:
+            print("  [OK] OpenCode is now available")
+        else:
+            print("  [--] OpenCode not installed (beast mode will be unavailable)")
+
+    # 2. Docker (informational)
+    print()
+    if shutil.which("docker"):
+        print("  [OK] Docker is available (sandbox execution enabled)")
+    else:
+        print("  [--] Docker not found (experiment sandbox unavailable)")
+        print("       Install: https://docs.docker.com/get-docker/")
+
+    # 3. LaTeX (informational)
+    if shutil.which("pdflatex"):
+        print("  [OK] LaTeX is available (PDF paper compilation enabled)")
+    else:
+        print("  [--] LaTeX not found (paper will be exported as .tex only)")
+        print("       Install: sudo apt install texlive-full  (or equivalent)")
+
+    print()
+    print("Run 'researchclaw doctor' for a full environment health check.")
+    return 0
+
 
 def cmd_report(args: argparse.Namespace) -> int:
     from researchclaw.report import generate_report, write_report
@@ -179,7 +546,8 @@ def main(argv: list[str] | None = None) -> int:
     run_p = sub.add_parser("run", help="Run the 23-stage research pipeline")
     _ = run_p.add_argument("--topic", "-t", help="Override research topic")
     _ = run_p.add_argument(
-        "--config", "-c", default="config.yaml", help="Config file path"
+        "--config", "-c", default=None,
+        help="Config file (default: auto-detect config.arc.yaml or config.yaml)",
     )
     _ = run_p.add_argument("--output", "-o", help="Output directory")
     _ = run_p.add_argument(
@@ -198,9 +566,14 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-noncritical-stage", action="store_true",
         help="Skip noncritical stages on failure instead of aborting"
     )
+    _ = run_p.add_argument(
+        "--no-graceful-degradation", action="store_true",
+        help="Disable graceful degradation: fail pipeline on quality gate failure"
+    )
     val_p = sub.add_parser("validate", help="Validate config file")
     _ = val_p.add_argument(
-        "--config", "-c", default="config.yaml", help="Config file path"
+        "--config", "-c", default=None,
+        help="Config file (default: auto-detect config.arc.yaml or config.yaml)",
     )
     _ = val_p.add_argument(
         "--no-check-paths", action="store_true", help="Skip path existence checks"
@@ -208,9 +581,17 @@ def main(argv: list[str] | None = None) -> int:
 
     doc_p = sub.add_parser("doctor", help="Check environment and configuration health")
     _ = doc_p.add_argument(
-        "--config", "-c", default="config.yaml", help="Config file path"
+        "--config", "-c", default=None,
+        help="Config file (default: auto-detect config.arc.yaml or config.yaml)",
     )
     _ = doc_p.add_argument("--output", "-o", help="Write JSON report to file")
+
+    init_p = sub.add_parser("init", help="Create config.arc.yaml from example template")
+    _ = init_p.add_argument(
+        "--force", action="store_true", help="Overwrite existing config.arc.yaml"
+    )
+
+    _ = sub.add_parser("setup", help="Check and install optional tools (OpenCode, etc.)")
 
     rpt_p = sub.add_parser("report", help="Generate human-readable run report")
     _ = rpt_p.add_argument(
@@ -227,6 +608,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_validate(args)
     elif command == "doctor":
         return cmd_doctor(args)
+    elif command == "init":
+        return cmd_init(args)
+    elif command == "setup":
+        return cmd_setup(args)
     elif command == "report":
         return cmd_report(args)
     else:
