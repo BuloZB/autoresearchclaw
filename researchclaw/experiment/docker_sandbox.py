@@ -138,6 +138,8 @@ class DockerSandbox:
         *,
         entry_point: str = "main.py",
         timeout_sec: int = 300,
+        args: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> SandboxResult:
         """Run a multi-file experiment project inside a container."""
         self._run_counter += 1
@@ -189,7 +191,13 @@ class DockerSandbox:
                 metrics={},
             )
 
-        return self._execute(staging, entry_point=entry_point, timeout_sec=timeout_sec)
+        return self._execute(
+            staging,
+            entry_point=entry_point,
+            timeout_sec=timeout_sec,
+            entry_args=args,
+            env_overrides=env_overrides,
+        )
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -254,7 +262,13 @@ class DockerSandbox:
     # ------------------------------------------------------------------
 
     def _execute(
-        self, staging_dir: Path, *, entry_point: str, timeout_sec: int
+        self,
+        staging_dir: Path,
+        *,
+        entry_point: str,
+        timeout_sec: int,
+        entry_args: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> SandboxResult:
         """Core execution: single container, three-phase via entrypoint.sh."""
         cfg = self.config
@@ -269,6 +283,8 @@ class DockerSandbox:
             staging_dir,
             entry_point=entry_point,
             container_name=container_name,
+            entry_args=entry_args,
+            env_overrides=env_overrides,
         )
 
         start = time.monotonic()
@@ -279,6 +295,8 @@ class DockerSandbox:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout_sec,
                 check=False,
             )
@@ -349,6 +367,8 @@ class DockerSandbox:
         *,
         entry_point: str,
         container_name: str,
+        entry_args: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
         """Build the ``docker run`` command list.
 
@@ -453,9 +473,20 @@ class DockerSandbox:
             else:
                 cmd.extend(["--gpus", "all"])
 
+        _SAFE_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        if env_overrides:
+            for name, value in sorted(env_overrides.items()):
+                if not value or not _SAFE_ENV_NAME.match(name):
+                    continue
+                # Strip null bytes from values to prevent subprocess ValueError
+                safe_value = str(value).replace("\x00", "")
+                cmd.extend(["-e", f"{name}={safe_value}"])
+
         # Image + entry point (passed as CMD arg to entrypoint.sh)
         cmd.append(cfg.image)
         cmd.append(entry_point)
+        if entry_args:
+            cmd.extend(entry_args)
 
         return cmd
 
