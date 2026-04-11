@@ -132,8 +132,9 @@ class ChatSession:
 
         try:
             response = llm_client.chat(messages)
-            self.add_ai_message(response)
-            return response
+            text = response.content if hasattr(response, "content") else str(response)
+            self.add_ai_message(text)
+            return text
         except Exception as exc:
             error_msg = f"[LLM error: {exc}]"
             logger.error("Chat LLM call failed: %s", exc)
@@ -223,7 +224,12 @@ def build_stage_context(
         "- Help the human researcher improve the stage output.",
         "- Be specific and actionable in your suggestions.",
         "- When the human is satisfied, they will approve the output.",
-        "- If asked to modify the output, provide the complete updated version.",
+        "- To edit a file, wrap the full updated content in edit markers:",
+        "  <<<FILE: filename>>>",
+        "  ...complete file content...",
+        "  <<<END_FILE>>>",
+        "- Edits are applied automatically when you use this format.",
+        "- Only use this format for files listed in the current stage output.",
     ])
 
     return "\n".join(lines)
