@@ -11,7 +11,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Mapping
-from typing import cast
+from typing import Any, cast
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import (
@@ -793,7 +793,7 @@ _PROVIDER_MODELS = {
         ["google/gemini-pro-1.5", "meta-llama/llama-3.1-70b-instruct"],
     ),
     "deepseek": ("deepseek-chat", ["deepseek-reasoner"]),
-    "minimax": ("MiniMax-M2.5", ["MiniMax-M2.5-highspeed"]),
+    "minimax": ("MiniMax-M3", ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"]),
     "ollama": ("llama3.2", ["mistral", "qwen2.5:7b"]),
 }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -384,17 +385,32 @@ def _execute_literature_collect(
 
         # Expand queries for broader coverage
         expanded_queries = _expand_search_queries(queries, config.research.topic)
+        literature_config = config.literature_search
+        s2_api_key = (
+            literature_config.s2_api_key
+            or config.llm.s2_api_key
+            or os.environ.get(literature_config.s2_api_key_env, "")
+        )
+        openalex_api_key = (
+            literature_config.openalex_api_key
+            or os.environ.get(literature_config.openalex_api_key_env, "")
+        )
         logger.info(
             "[literature] Searching %d queries (expanded from %d) "
-            "across OpenAlex → S2 → arXiv…",
+            "across %s",
             len(expanded_queries),
             len(queries),
+            " -> ".join(literature_config.sources),
         )
         papers = search_papers_multi_query(
             expanded_queries,
-            limit_per_query=40,
+            limit_per_query=literature_config.max_results_per_query,
+            sources=literature_config.sources,
             year_min=year_min,
-            s2_api_key=config.llm.s2_api_key,
+            s2_api_key=s2_api_key,
+            openalex_email=literature_config.openalex_email,
+            openalex_api_key=openalex_api_key,
+            inter_query_delay=literature_config.inter_query_delay_sec,
         )
         if papers:
             real_search_succeeded = True
@@ -821,6 +837,53 @@ def _execute_knowledge_extract(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     shortlist = _read_prior_artifact(run_dir, "shortlist.jsonl") or ""
+
+    # IMP-21: Defensive gate — refuse to run on an empty/missing shortlist.
+    # Stage 5 (LITERATURE_SCREEN) returns PAUSED with decision="rejected_all"
+    # when its strict screen rejects all candidates, in which case no
+    # shortlist.jsonl is written. Without this gate, Stage 6 spends an LLM
+    # turn extracting knowledge cards from empty input, produces low-quality
+    # fallback cards, and lets downstream stages cascade on garbage.
+    #
+    # We return PAUSED (mirroring Stage 5's pattern) rather than
+    # BLOCKED_APPROVAL because the runner halts on PAUSED unconditionally
+    # (runner.py: ``if result.status == StageStatus.PAUSED: break``), whereas
+    # BLOCKED_APPROVAL only halts when ``stop_on_gate=True`` — and
+    # ``--auto-approve`` explicitly sets ``stop_on_gate=False``, which is
+    # the exact scenario this gate must prevent the cascade for.
+    if not _parse_jsonl_rows(shortlist):
+        logger.warning(
+            "Stage 6: shortlist.jsonl is empty or missing — Stage 5 likely "
+            "rejected all candidates. Refusing to extract from empty input."
+        )
+        (stage_dir / "knowledge_meta.json").write_text(
+            json.dumps(
+                {
+                    "outcome": "upstream_empty_shortlist",
+                    "shortlist_rows": 0,
+                    "note": (
+                        "Stage 6 (knowledge_extract) requires a non-empty "
+                        "shortlist.jsonl from Stage 5 (literature_screen). "
+                        "Resolve Stage 5 (refine search queries, manually "
+                        "approve a shortlist, or restart from "
+                        "search_strategy) before resuming."
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return StageResult(
+            stage=Stage.KNOWLEDGE_EXTRACT,
+            status=StageStatus.PAUSED,
+            artifacts=("knowledge_meta.json",),
+            error=(
+                "Cannot extract knowledge cards: shortlist.jsonl is empty "
+                "or missing. Resolve Stage 5 (literature_screen) first."
+            ),
+            evidence_refs=("stage-06/knowledge_meta.json",),
+            decision="upstream_blocked",
+        )
 
     # Inject web context from Stage 4 if available
     web_context = _read_prior_artifact(run_dir, "web_context.md") or ""
